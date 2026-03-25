@@ -23,7 +23,7 @@ import {
   Volume2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type, Modality } from "@google/genai";
 
 interface Contact {
   name: string;
@@ -38,20 +38,115 @@ type ViewMode = 'home' | 'setup' | 'dialer' | 'summary';
 
 export default function App() {
   const [contacts, setContacts] = useState<Contact[]>([]);
-  const [viewMode, setViewMode] = useState<ViewMode>('home');
+  const [viewMode, setViewMode] = useState<ViewMode>(() => {
+    const saved = localStorage.getItem('sheetUrl');
+    return saved ? 'home' : 'setup';
+  });
   const [currentIndex, setCurrentIndex] = useState(0);
-  const [sheetUrl, setSheetUrl] = useState('');
+  const [sheetUrl, setSheetUrl] = useState(() => localStorage.getItem('sheetUrl') || '');
   const [isLoading, setIsLoading] = useState(false);
   const [isDialing, setIsDialing] = useState(false);
   const [aiCommand, setAiCommand] = useState('');
   const [isAiProcessing, setIsAiProcessing] = useState(false);
   const [aiResponse, setAiResponse] = useState('');
+  const [isListening, setIsListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const audioRef = React.useRef<HTMLAudioElement | null>(null);
+  const recognitionRef = useRef<any>(null);
 
-  const speak = (text: string) => {
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = 'nl-NL';
-    window.speechSynthesis.speak(utterance);
+  const speak = async (text: string) => {
+    // Stop any current audio
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    window.speechSynthesis.cancel();
+    setIsSpeaking(true);
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash-preview-tts",
+        contents: [{ parts: [{ text: `Spreek dit op een natuurlijke, behulpzame manier uit in het Nederlands: ${text}` }] }],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: 'Kore' },
+            },
+          },
+        },
+      });
+
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (base64Audio) {
+        const audioSrc = `data:audio/wav;base64,${base64Audio}`;
+        const audio = new Audio(audioSrc);
+        audioRef.current = audio;
+        audio.onended = () => setIsSpeaking(false);
+        await audio.play();
+      } else {
+        throw new Error("No audio data");
+      }
+    } catch (error) {
+      console.error("TTS Error, falling back to system voice:", error);
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'nl-NL';
+      utterance.onend = () => setIsSpeaking(false);
+      window.speechSynthesis.speak(utterance);
+    }
   };
+
+  // Persist sheet URL
+  React.useEffect(() => {
+    localStorage.setItem('sheetUrl', sheetUrl);
+  }, [sheetUrl]);
+
+  // Continuous Voice Recognition Logic
+  React.useEffect(() => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'nl-NL';
+    recognition.continuous = false;
+    recognition.interimResults = false;
+
+    recognition.onresult = (event: any) => {
+      const transcript = event.results[0][0].transcript;
+      setAiCommand(transcript);
+      handleAiCommand(transcript);
+    };
+
+    recognition.onend = () => {
+      if (isListening && !isDialing && !isAiProcessing && !isSpeaking) {
+        try {
+          recognition.start();
+        } catch (e) {}
+      }
+    };
+
+    recognitionRef.current = recognition;
+
+    if (isListening && !isDialing && !isAiProcessing && !isSpeaking) {
+      try {
+        recognition.start();
+      } catch (e) {}
+    }
+
+    return () => {
+      recognition.stop();
+    };
+  }, [isListening, isDialing, isAiProcessing, isSpeaking]);
+
+  // Automatically read contact info when it changes
+  React.useEffect(() => {
+    if (viewMode === 'dialer' && contacts[currentIndex]) {
+      const contact = contacts[currentIndex];
+      const text = `Volgende contact: ${contact.name}. ${contact.organization ? `Van organisatie ${contact.organization}.` : ''} ${contact.subject ? `De taak is: ${contact.subject}.` : ''}`;
+      speak(text);
+    }
+  }, [currentIndex, viewMode, contacts]);
 
   const fetchSheetData = async () => {
     if (!sheetUrl) {
@@ -141,13 +236,25 @@ export default function App() {
               }
             },
             {
-              name: "goToContact",
-              description: "Ga naar een specifiek contact in de lijst zonder direct te bellen.",
+              name: "updateStatus",
+              description: "Update de status van het huidige contact (succes, bezet, overslaan) en ga naar de volgende.",
               parameters: {
                 type: Type.OBJECT,
                 properties: {
-                  index: { type: Type.INTEGER, description: "Index van de persoon (1-based)" }
-                }
+                  status: { type: Type.STRING, enum: ["completed", "busy", "skipped"], description: "De nieuwe status" }
+                },
+                required: ["status"]
+              }
+            },
+            {
+              name: "navigate",
+              description: "Ga naar het volgende of vorige contact.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  direction: { type: Type.STRING, enum: ["next", "prev"], description: "Richting van navigatie" }
+                },
+                required: ["direction"]
               }
             }
           ]
@@ -161,14 +268,15 @@ export default function App() {
         contents: `De gebruiker geeft een commando voor een belsysteem.
 Huidige lijst met contacten:
 ${contactsContext}
+Huidig contact index: ${currentIndex + 1}
 
 Commando: "${command}"
 
-Als het commando een actie vereist (bellen, lezen, navigeren), gebruik dan de tools.
+Als het commando een actie vereist (bellen, lezen, navigeren, status updaten), gebruik dan de tools.
 Als het een vraag is, geef dan een kort antwoord in het Nederlands.`,
         config: {
           tools,
-          systemInstruction: "Je bent een behulpzame assistent voor een hands-free belsysteem. Je spreekt Nederlands. Je kunt contacten bellen, taken voorlezen en navigeren door de lijst."
+          systemInstruction: "Je bent een behulpzame assistent voor een hands-free belsysteem. Je spreekt Nederlands. Je kunt contacten bellen, taken voorlezen, navigeren door de lijst en de status van calls bijwerken."
         }
       });
 
@@ -204,13 +312,16 @@ Als het een vraag is, geef dan een kort antwoord in het Nederlands.`,
               setAiResponse("Ik kon die persoon niet vinden.");
               speak("Ik kon die persoon niet vinden.");
             }
-          } else if (call.name === 'goToContact') {
-            const idx = (call.args.index as number) - 1;
-            if (idx >= 0 && idx < contacts.length) {
-              setCurrentIndex(idx);
-              setAiResponse(`Gegaan naar ${contacts[idx].name}.`);
-              speak(`Gegaan naar ${contacts[idx].name}.`);
-            }
+          } else if (call.name === 'updateStatus') {
+            const status = call.args.status as 'completed' | 'busy' | 'skipped';
+            updateStatus(status);
+            setAiResponse(`Status bijgewerkt naar ${status === 'completed' ? 'succes' : status === 'busy' ? 'bezet' : 'overgeslagen'}.`);
+            speak(`Status bijgewerkt. Volgende contact.`);
+          } else if (call.name === 'navigate') {
+            const direction = call.args.direction as 'next' | 'prev';
+            if (direction === 'next') nextContact();
+            else prevContact();
+            setAiResponse(`Navigeren naar ${direction === 'next' ? 'volgende' : 'vorige'}.`);
           }
         }
       } else {
@@ -227,20 +338,14 @@ Als het een vraag is, geef dan een kort antwoord in het Nederlands.`,
   };
 
   const startVoiceRecognition = () => {
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      alert("Spraakherkenning wordt niet ondersteund in deze browser.");
-      return;
-    }
+    setIsListening(true);
+  };
 
-    const recognition = new SpeechRecognition();
-    recognition.lang = 'nl-NL';
-    recognition.onresult = (event: any) => {
-      const transcript = event.results[0][0].transcript;
-      setAiCommand(transcript);
-      handleAiCommand(transcript);
-    };
-    recognition.start();
+  const stopVoiceRecognition = () => {
+    setIsListening(false);
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+    }
   };
 
   const requestMicrophone = async () => {
@@ -299,25 +404,6 @@ Als het een vraag is, geef dan een kort antwoord in het Nederlands.`,
 
   return (
     <div className="min-h-screen bg-[#f8fafc] text-[#0f172a] font-sans selection:bg-blue-100">
-      {/* Header */}
-      <header className="bg-white border-b border-slate-200 px-6 py-4 flex justify-between items-center sticky top-0 z-10 shadow-sm">
-        <div className="flex items-center gap-3">
-          <div className="bg-blue-600 p-2 rounded-xl shadow-lg shadow-blue-200">
-            <PhoneCall className="text-white w-5 h-5" />
-          </div>
-          <h1 className="text-xl font-bold tracking-tight text-slate-800">Hands-Free Dialer</h1>
-        </div>
-        {viewMode !== 'home' && (
-          <button 
-            onClick={reset}
-            className="text-sm font-semibold text-slate-500 hover:text-blue-600 transition-all flex items-center gap-2 px-3 py-1.5 rounded-lg hover:bg-slate-50"
-          >
-            <RotateCcw className="w-4 h-4" />
-            Reset
-          </button>
-        )}
-      </header>
-
       <main className="max-w-4xl mx-auto p-6">
         <AnimatePresence mode="wait">
           {viewMode === 'home' && (
@@ -326,19 +412,26 @@ Als het een vraag is, geef dan een kort antwoord in het Nederlands.`,
               initial={{ opacity: 0, scale: 0.8 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.8 }}
-              className="flex flex-col items-center justify-center min-h-[75vh] text-center px-4"
+              className="flex flex-col items-center justify-center min-h-[80vh] text-center px-4 relative"
             >
+              <button 
+                onClick={() => setViewMode('setup')}
+                className="absolute top-0 right-0 p-4 text-slate-400 hover:text-blue-600 transition-colors"
+              >
+                <Settings2 className="w-8 h-8" />
+              </button>
+
               <div className="mb-12">
-                <div className="bg-blue-600 w-12 h-12 rounded-xl flex items-center justify-center shadow-lg shadow-blue-200">
-                  <PhoneCall className="w-6 h-6 text-white" />
-                </div>
+                <h1 className="text-4xl font-black text-slate-900 mb-4">Hands-Free Dialer</h1>
+                <p className="text-slate-500 font-medium">Klaar om de lijst te starten?</p>
               </div>
               
               <button 
-                onClick={() => setViewMode('setup')}
-                className="group relative bg-green-500 text-white w-64 h-64 rounded-full shadow-[0_20px_60px_rgba(34,197,94,0.4)] hover:scale-105 transition-all active:scale-95 flex items-center justify-center animate-pulse"
+                onClick={fetchSheetData}
+                className="group relative bg-green-500 text-white w-64 h-64 rounded-full shadow-[0_20px_60px_rgba(34,197,94,0.4)] hover:scale-105 transition-all active:scale-95 flex flex-col items-center justify-center gap-4 animate-pulse"
               >
-                <Phone className="w-32 h-32 fill-current" />
+                <Play className="w-24 h-24 fill-current" />
+                <span className="text-2xl font-black">START</span>
               </button>
             </motion.div>
           )}
@@ -399,7 +492,7 @@ Als het een vraag is, geef dan een kort antwoord in het Nederlands.`,
                     <div className="w-6 h-6 border-4 border-white border-t-transparent rounded-full animate-spin" />
                   ) : (
                     <>
-                      Laden & Starten
+                      Opslaan & Starten
                       <Play className="w-6 h-6 fill-current" />
                     </>
                   )}
@@ -413,137 +506,52 @@ Als het een vraag is, geef dan een kort antwoord in het Nederlands.`,
               key="dialer"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              className="flex flex-col items-center gap-10"
+              className="flex flex-col items-center justify-center min-h-[80vh] gap-12"
             >
-              {/* Progress Bar */}
-              <div className="w-full max-w-md">
-                <div className="flex justify-between text-sm font-bold text-slate-400 mb-3 uppercase tracking-widest">
-                  <span>Voortgang</span>
-                  <span>{currentIndex + 1} / {contacts.length}</span>
-                </div>
-                <div className="w-full bg-slate-200 h-4 rounded-full overflow-hidden shadow-inner">
+              {/* AI Status Overlay */}
+              <AnimatePresence>
+                {isAiProcessing && (
                   <motion.div 
-                    className="bg-blue-600 h-full shadow-[0_0_20px_rgba(37,99,235,0.5)]"
-                    initial={{ width: 0 }}
-                    animate={{ width: `${((currentIndex + 1) / contacts.length) * 100}%` }}
-                  />
-                </div>
-              </div>
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    className="fixed inset-0 bg-blue-600/90 backdrop-blur-sm z-50 flex flex-col items-center justify-center text-white p-8"
+                  >
+                    <div className="w-24 h-24 border-8 border-white border-t-transparent rounded-full animate-spin mb-8" />
+                    <p className="text-3xl font-black">AI verwerkt commando...</p>
+                  </motion.div>
+                )}
+              </AnimatePresence>
 
-              {/* Dialer Card */}
-              <motion.div 
-                key={currentIndex}
-                initial={{ x: 50, opacity: 0 }}
-                animate={{ x: 0, opacity: 1 }}
-                exit={{ x: -50, opacity: 0 }}
-                className="w-full max-w-lg bg-white rounded-[3rem] shadow-2xl p-12 flex flex-col items-center text-center gap-8 border border-slate-100 relative overflow-hidden"
-              >
-                {/* AI Status Overlay */}
-                <AnimatePresence>
-                  {isAiProcessing && (
-                    <motion.div 
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      exit={{ opacity: 0 }}
-                      className="absolute inset-0 bg-blue-600/90 backdrop-blur-sm z-20 flex flex-col items-center justify-center text-white p-8"
-                    >
-                      <div className="w-16 h-16 border-4 border-white border-t-transparent rounded-full animate-spin mb-4" />
-                      <p className="text-xl font-bold">AI verwerkt commando...</p>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-
-                <div className="w-32 h-32 bg-blue-50 rounded-[2.5rem] flex items-center justify-center text-blue-600 text-5xl font-black shadow-inner rotate-3">
-                  {currentContact.name.charAt(0)}
-                </div>
-                
-                <div className="space-y-2">
-                  {currentContact.organization && (
-                    <p className="text-sm font-black text-blue-600 uppercase tracking-widest">{currentContact.organization}</p>
-                  )}
-                  <h2 className="text-4xl font-black text-slate-900">{currentContact.name}</h2>
-                  <p className="text-2xl text-slate-400 font-mono font-bold tracking-tighter">{currentContact.phone}</p>
-                  {currentContact.subject && (
-                    <div className="mt-4 p-4 bg-slate-50 rounded-2xl border border-slate-100 italic text-slate-600">
-                      "{currentContact.subject}"
-                    </div>
-                  )}
-                </div>
-
+              <div className="w-full max-w-lg flex flex-col items-center gap-12">
                 <motion.a 
                   href={`tel:${currentContact.phone}`}
-                  onClick={() => setIsDialing(true)}
-                  animate={{ scale: [1, 1.02, 1] }}
+                  onClick={() => {
+                    setIsDialing(true);
+                    stopVoiceRecognition();
+                  }}
+                  animate={{ scale: [1, 1.05, 1] }}
                   transition={{ repeat: Infinity, duration: 2 }}
-                  className="w-full bg-green-500 text-white rounded-[3rem] py-14 flex flex-col items-center justify-center gap-6 text-5xl font-black hover:bg-green-600 transition-all shadow-[0_20px_50px_rgba(34,197,94,0.3)] active:scale-95 group"
+                  className="w-80 h-80 bg-green-500 text-white rounded-full flex flex-col items-center justify-center gap-4 text-4xl font-black shadow-[0_30px_70px_rgba(34,197,94,0.4)] hover:bg-green-600 transition-all active:scale-95 group"
                 >
-                  <Phone className="w-20 h-20 fill-current group-hover:rotate-12 transition-transform" />
+                  <Phone className="w-24 h-24 fill-current group-hover:rotate-12 transition-transform" />
                   BEL NU
                 </motion.a>
 
-                {/* AI Response Text */}
-                {aiResponse && (
-                  <motion.div 
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    className="w-full p-4 bg-blue-50 text-blue-800 rounded-2xl text-sm font-bold flex items-start gap-3"
-                  >
-                    <Volume2 className="w-5 h-5 shrink-0" />
-                    <p className="text-left">{aiResponse}</p>
-                  </motion.div>
-                )}
-
-                {/* Status Options */}
-                <div className="grid grid-cols-3 gap-4 w-full">
+                <div className="flex flex-col items-center gap-4">
                   <button 
-                    onClick={() => updateStatus('completed')}
-                    className="flex flex-col items-center gap-3 p-5 bg-green-50 text-green-700 rounded-3xl border-2 border-green-100 hover:bg-green-100 transition-all active:scale-95"
+                    onClick={isListening ? stopVoiceRecognition : startVoiceRecognition}
+                    className={`w-32 h-32 rounded-full shadow-2xl transition-all active:scale-90 flex items-center justify-center group relative ${isListening ? 'bg-red-500 shadow-red-200 animate-pulse' : 'bg-blue-600 shadow-blue-200'}`}
                   >
-                    <CheckCircle2 className="w-6 h-6" />
-                    <span className="text-xs font-black uppercase tracking-widest">Succes</span>
+                    {isListening ? <Mic className="w-14 h-14 text-white" /> : <Volume2 className="w-14 h-14 text-white" />}
+                    <div className="absolute -bottom-16 left-1/2 -translate-x-1/2 bg-slate-900 text-white text-sm px-4 py-2 rounded-xl opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap font-bold">
+                      {isListening ? 'AI Luistert...' : 'AI Inschakelen'}
+                    </div>
                   </button>
-                  <button 
-                    onClick={() => updateStatus('busy')}
-                    className="flex flex-col items-center gap-3 p-5 bg-yellow-50 text-yellow-700 rounded-3xl border-2 border-yellow-100 hover:bg-yellow-100 transition-all active:scale-95"
-                  >
-                    <Pause className="w-6 h-6" />
-                    <span className="text-xs font-black uppercase tracking-widest">Bezet</span>
-                  </button>
-                  <button 
-                    onClick={() => updateStatus('skipped')}
-                    className="flex flex-col items-center gap-3 p-5 bg-slate-50 text-slate-500 rounded-3xl border-2 border-slate-100 hover:bg-slate-200 transition-all active:scale-95"
-                  >
-                    <X className="w-6 h-6" />
-                    <span className="text-xs font-black uppercase tracking-widest">Overslaan</span>
-                  </button>
+                  {isListening && (
+                    <p className="text-blue-600 font-black animate-bounce">AI Luistert...</p>
+                  )}
                 </div>
-              </motion.div>
-
-              <div className="flex items-center gap-8">
-                <button 
-                  onClick={prevContact}
-                  disabled={currentIndex === 0}
-                  className="p-6 bg-white rounded-[2rem] shadow-lg border border-slate-100 disabled:opacity-30 hover:bg-slate-50 transition-all active:scale-90"
-                >
-                  <ChevronLeft className="w-10 h-10 text-slate-600" />
-                </button>
-                
-                <button 
-                  onClick={startVoiceRecognition}
-                  className="p-8 bg-blue-600 text-white rounded-full shadow-2xl shadow-blue-200 hover:scale-110 transition-all active:scale-90 relative group"
-                >
-                  <Mic className="w-12 h-12" />
-                  <span className="absolute -top-12 left-1/2 -translate-x-1/2 bg-slate-900 text-white text-xs px-3 py-1 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">
-                    Spraak Commando
-                  </span>
-                </button>
-
-                <button 
-                  onClick={nextContact}
-                  className="p-6 bg-white rounded-[2rem] shadow-lg border border-slate-100 hover:bg-slate-50 transition-all active:scale-90"
-                >
-                  <ChevronRight className="w-10 h-10 text-slate-600" />
-                </button>
               </div>
             </motion.div>
           )}
