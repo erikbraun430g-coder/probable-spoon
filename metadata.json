@@ -1,5 +1,5 @@
 {
   "name": "Hands-Free Dialer",
   "description": "Automated contact dialer that reads from CSV and streamlines the calling process.",
-  "requestFramePermissions": []
+  "requestFramePermissions": ["microphone"]
 }

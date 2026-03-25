@@ -17,13 +17,19 @@ import {
   X,
   FileSpreadsheet,
   Settings2,
-  PhoneCall
+  PhoneCall,
+  Mic,
+  MessageSquare,
+  Volume2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { GoogleGenAI, Type } from "@google/genai";
 
 interface Contact {
   name: string;
   phone: string;
+  organization?: string;
+  subject?: string;
   status?: 'pending' | 'completed' | 'skipped' | 'busy';
   [key: string]: any;
 }
@@ -37,6 +43,15 @@ export default function App() {
   const [sheetUrl, setSheetUrl] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isDialing, setIsDialing] = useState(false);
+  const [aiCommand, setAiCommand] = useState('');
+  const [isAiProcessing, setIsAiProcessing] = useState(false);
+  const [aiResponse, setAiResponse] = useState('');
+
+  const speak = (text: string) => {
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'nl-NL';
+    window.speechSynthesis.speak(utterance);
+  };
 
   const fetchSheetData = async () => {
     if (!sheetUrl) {
@@ -44,27 +59,33 @@ export default function App() {
       return;
     }
 
+    let finalUrl = sheetUrl;
+    if (sheetUrl.includes('docs.google.com/spreadsheets/d/') && !sheetUrl.includes('export?format=csv') && !sheetUrl.includes('pub?output=csv')) {
+      const match = sheetUrl.match(/\/d\/([a-zA-Z0-9-_]+)/);
+      if (match && match[1]) {
+        finalUrl = `https://docs.google.com/spreadsheets/d/${match[1]}/export?format=csv`;
+      }
+    }
+
     setIsLoading(true);
-    Papa.parse(sheetUrl, {
+    Papa.parse(finalUrl, {
       download: true,
       header: true,
       skipEmptyLines: true,
       complete: (results) => {
-        const data = results.data as any[];
-        // Try to find Name and Phone columns automatically
-        const fields = results.meta.fields || [];
-        const nameKey = fields.find(f => f.toLowerCase().includes('naam') || f.toLowerCase().includes('name')) || fields[0];
-        const phoneKey = fields.find(f => f.toLowerCase().includes('telefoon') || f.toLowerCase().includes('phone') || f.toLowerCase().includes('tel')) || fields[1];
+        let data = results.data as any[];
+        let fields = results.meta.fields || [];
 
-        if (!nameKey || !phoneKey) {
-          alert('Kon geen Naam of Telefoon kolommen vinden in de CSV.');
-          setIsLoading(false);
-          return;
-        }
+        const nameKey = fields.find(f => f.toLowerCase().includes('contact')) || fields.find(f => f.toLowerCase().includes('naam') || f.toLowerCase().includes('name')) || fields[0];
+        const phoneKey = fields.find(f => f.toLowerCase().includes('mobiel')) || fields.find(f => f.toLowerCase().includes('telefoon') || f.toLowerCase().includes('phone') || f.toLowerCase().includes('tel')) || fields[1];
+        const orgKey = fields.find(f => f.toLowerCase().includes('organisatie')) || fields.find(f => f.toLowerCase().includes('bedrijf') || f.toLowerCase().includes('org'));
+        const subjectKey = fields.find(f => f.toLowerCase().includes('onderwerp')) || fields.find(f => f.toLowerCase().includes('taak') || f.toLowerCase().includes('subject'));
 
         const normalized = data.map(c => ({
           name: c[nameKey] || 'Onbekend',
           phone: String(c[phoneKey] || '').replace(/[^0-9+]/g, ''),
+          organization: orgKey ? c[orgKey] : undefined,
+          subject: subjectKey ? c[subjectKey] : undefined,
           status: 'pending' as const
         })).filter(c => c.phone.length > 0);
 
@@ -84,6 +105,156 @@ export default function App() {
       }
     });
   };
+
+  const handleAiCommand = async (command: string) => {
+    if (!command.trim()) return;
+    setIsAiProcessing(true);
+    setAiResponse('');
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const model = "gemini-3.1-pro-preview";
+
+      const tools = [
+        {
+          functionDeclarations: [
+            {
+              name: "callContact",
+              description: "Bel een contactpersoon uit de lijst op basis van naam of index.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  name: { type: Type.STRING, description: "Naam van de persoon" },
+                  index: { type: Type.INTEGER, description: "Index van de persoon in de lijst (1-based)" }
+                }
+              }
+            },
+            {
+              name: "readTask",
+              description: "Lees het onderwerp of de taak voor van een contactpersoon.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  name: { type: Type.STRING, description: "Naam van de persoon" },
+                  index: { type: Type.INTEGER, description: "Index van de persoon in de lijst (1-based)" }
+                }
+              }
+            },
+            {
+              name: "goToContact",
+              description: "Ga naar een specifiek contact in de lijst zonder direct te bellen.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  index: { type: Type.INTEGER, description: "Index van de persoon (1-based)" }
+                }
+              }
+            }
+          ]
+        }
+      ];
+
+      const contactsContext = contacts.map((c, i) => `${i + 1}. ${c.name} (${c.organization || 'Geen organisatie'}), Taak: ${c.subject || 'Geen taak'}`).join('\n');
+
+      const response = await ai.models.generateContent({
+        model,
+        contents: `De gebruiker geeft een commando voor een belsysteem.
+Huidige lijst met contacten:
+${contactsContext}
+
+Commando: "${command}"
+
+Als het commando een actie vereist (bellen, lezen, navigeren), gebruik dan de tools.
+Als het een vraag is, geef dan een kort antwoord in het Nederlands.`,
+        config: {
+          tools,
+          systemInstruction: "Je bent een behulpzame assistent voor een hands-free belsysteem. Je spreekt Nederlands. Je kunt contacten bellen, taken voorlezen en navigeren door de lijst."
+        }
+      });
+
+      const functionCalls = response.functionCalls;
+      if (functionCalls) {
+        for (const call of functionCalls) {
+          if (call.name === 'callContact') {
+            let idx = -1;
+            if (call.args.index) idx = (call.args.index as number) - 1;
+            else if (call.args.name) idx = contacts.findIndex(c => c.name.toLowerCase().includes((call.args.name as string).toLowerCase()));
+
+            if (idx >= 0 && idx < contacts.length) {
+              setCurrentIndex(idx);
+              setAiResponse(`Ik ga ${contacts[idx].name} bellen.`);
+              speak(`Ik ga ${contacts[idx].name} bellen.`);
+              setTimeout(() => {
+                window.location.href = `tel:${contacts[idx].phone}`;
+              }, 1500);
+            } else {
+              setAiResponse("Ik kon die persoon niet vinden in de lijst.");
+              speak("Ik kon die persoon niet vinden in de lijst.");
+            }
+          } else if (call.name === 'readTask') {
+            let idx = -1;
+            if (call.args.index) idx = (call.args.index as number) - 1;
+            else if (call.args.name) idx = contacts.findIndex(c => c.name.toLowerCase().includes((call.args.name as string).toLowerCase()));
+
+            if (idx >= 0 && idx < contacts.length) {
+              const task = contacts[idx].subject || "Er is geen specifieke taak genoteerd.";
+              setAiResponse(`Taak voor ${contacts[idx].name}: ${task}`);
+              speak(`De taak voor ${contacts[idx].name} is: ${task}`);
+            } else {
+              setAiResponse("Ik kon die persoon niet vinden.");
+              speak("Ik kon die persoon niet vinden.");
+            }
+          } else if (call.name === 'goToContact') {
+            const idx = (call.args.index as number) - 1;
+            if (idx >= 0 && idx < contacts.length) {
+              setCurrentIndex(idx);
+              setAiResponse(`Gegaan naar ${contacts[idx].name}.`);
+              speak(`Gegaan naar ${contacts[idx].name}.`);
+            }
+          }
+        }
+      } else {
+        setAiResponse(response.text || "Ik begrijp het commando niet helemaal.");
+        speak(response.text || "Ik begrijp het commando niet helemaal.");
+      }
+    } catch (error) {
+      console.error('AI Error:', error);
+      setAiResponse("Er ging iets mis bij het verwerken van het AI commando.");
+    } finally {
+      setIsAiProcessing(false);
+      setAiCommand('');
+    }
+  };
+
+  const startVoiceRecognition = () => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert("Spraakherkenning wordt niet ondersteund in deze browser.");
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'nl-NL';
+    recognition.onresult = (event: any) => {
+      const transcript = event.results[0][0].transcript;
+      setAiCommand(transcript);
+      handleAiCommand(transcript);
+    };
+    recognition.start();
+  };
+
+  const requestMicrophone = async () => {
+    try {
+      await navigator.mediaDevices.getUserMedia({ audio: true });
+      console.log('Microphone access granted');
+    } catch (err) {
+      console.error('Microphone access denied:', err);
+    }
+  };
+
+  React.useEffect(() => {
+    requestMicrophone();
+  }, []);
 
   const nextContact = () => {
     if (currentIndex < contacts.length - 1) {
@@ -152,39 +323,23 @@ export default function App() {
           {viewMode === 'home' && (
             <motion.div
               key="home"
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
+              initial={{ opacity: 0, scale: 0.8 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.8 }}
               className="flex flex-col items-center justify-center min-h-[75vh] text-center px-4"
             >
-              <motion.div 
-                animate={{ rotate: [0, 5, -5, 0] }}
-                transition={{ repeat: Infinity, duration: 5 }}
-                className="bg-blue-600 w-32 h-32 rounded-[2.5rem] flex items-center justify-center mb-10 shadow-[0_20px_50px_rgba(37,99,235,0.3)]"
-              >
-                <PhoneCall className="w-16 h-16 text-white" />
-              </motion.div>
-              
-              <h2 className="text-6xl font-black mb-6 tracking-tight text-slate-900 leading-tight">
-                Hands-Free <br />
-                <span className="text-blue-600">Dialer</span>
-              </h2>
-              
-              <p className="text-slate-500 text-xl max-w-md mb-12 font-medium leading-relaxed">
-                Koppel je Google Sheets database en start direct met bellen.
-              </p>
+              <div className="mb-12">
+                <div className="bg-blue-600 w-12 h-12 rounded-xl flex items-center justify-center shadow-lg shadow-blue-200">
+                  <PhoneCall className="w-6 h-6 text-white" />
+                </div>
+              </div>
               
               <button 
                 onClick={() => setViewMode('setup')}
-                className="group relative bg-blue-600 text-white text-3xl font-black px-16 py-8 rounded-[2.5rem] shadow-[0_20px_40px_rgba(37,99,235,0.4)] hover:scale-105 transition-all active:scale-95 flex items-center gap-4"
+                className="group relative bg-green-500 text-white w-64 h-64 rounded-full shadow-[0_20px_60px_rgba(34,197,94,0.4)] hover:scale-105 transition-all active:scale-95 flex items-center justify-center animate-pulse"
               >
-                START DE APP
-                <ChevronRight className="w-10 h-10 group-hover:translate-x-2 transition-transform" />
+                <Phone className="w-32 h-32 fill-current" />
               </button>
-              
-              <p className="mt-8 text-slate-400 font-bold text-sm uppercase tracking-widest">
-                Tik om te beginnen
-              </p>
             </motion.div>
           )}
 
@@ -281,15 +436,38 @@ export default function App() {
                 initial={{ x: 50, opacity: 0 }}
                 animate={{ x: 0, opacity: 1 }}
                 exit={{ x: -50, opacity: 0 }}
-                className="w-full max-w-lg bg-white rounded-[3rem] shadow-2xl p-12 flex flex-col items-center text-center gap-10 border border-slate-100"
+                className="w-full max-w-lg bg-white rounded-[3rem] shadow-2xl p-12 flex flex-col items-center text-center gap-8 border border-slate-100 relative overflow-hidden"
               >
+                {/* AI Status Overlay */}
+                <AnimatePresence>
+                  {isAiProcessing && (
+                    <motion.div 
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="absolute inset-0 bg-blue-600/90 backdrop-blur-sm z-20 flex flex-col items-center justify-center text-white p-8"
+                    >
+                      <div className="w-16 h-16 border-4 border-white border-t-transparent rounded-full animate-spin mb-4" />
+                      <p className="text-xl font-bold">AI verwerkt commando...</p>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
                 <div className="w-32 h-32 bg-blue-50 rounded-[2.5rem] flex items-center justify-center text-blue-600 text-5xl font-black shadow-inner rotate-3">
                   {currentContact.name.charAt(0)}
                 </div>
                 
-                <div>
-                  <h2 className="text-4xl font-black mb-3 text-slate-900">{currentContact.name}</h2>
+                <div className="space-y-2">
+                  {currentContact.organization && (
+                    <p className="text-sm font-black text-blue-600 uppercase tracking-widest">{currentContact.organization}</p>
+                  )}
+                  <h2 className="text-4xl font-black text-slate-900">{currentContact.name}</h2>
                   <p className="text-2xl text-slate-400 font-mono font-bold tracking-tighter">{currentContact.phone}</p>
+                  {currentContact.subject && (
+                    <div className="mt-4 p-4 bg-slate-50 rounded-2xl border border-slate-100 italic text-slate-600">
+                      "{currentContact.subject}"
+                    </div>
+                  )}
                 </div>
 
                 <motion.a 
@@ -302,6 +480,18 @@ export default function App() {
                   <Phone className="w-20 h-20 fill-current group-hover:rotate-12 transition-transform" />
                   BEL NU
                 </motion.a>
+
+                {/* AI Response Text */}
+                {aiResponse && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="w-full p-4 bg-blue-50 text-blue-800 rounded-2xl text-sm font-bold flex items-start gap-3"
+                  >
+                    <Volume2 className="w-5 h-5 shrink-0" />
+                    <p className="text-left">{aiResponse}</p>
+                  </motion.div>
+                )}
 
                 {/* Status Options */}
                 <div className="grid grid-cols-3 gap-4 w-full">
@@ -339,11 +529,20 @@ export default function App() {
                 </button>
                 
                 <button 
-                  onClick={nextContact}
-                  className="px-16 py-6 bg-white rounded-[2rem] shadow-lg border border-slate-100 font-black text-2xl text-slate-800 flex items-center gap-3 hover:bg-slate-50 transition-all active:scale-90"
+                  onClick={startVoiceRecognition}
+                  className="p-8 bg-blue-600 text-white rounded-full shadow-2xl shadow-blue-200 hover:scale-110 transition-all active:scale-90 relative group"
                 >
-                  Volgende
-                  <ChevronRight className="w-8 h-8" />
+                  <Mic className="w-12 h-12" />
+                  <span className="absolute -top-12 left-1/2 -translate-x-1/2 bg-slate-900 text-white text-xs px-3 py-1 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">
+                    Spraak Commando
+                  </span>
+                </button>
+
+                <button 
+                  onClick={nextContact}
+                  className="p-6 bg-white rounded-[2rem] shadow-lg border border-slate-100 hover:bg-slate-50 transition-all active:scale-90"
+                >
+                  <ChevronRight className="w-10 h-10 text-slate-600" />
                 </button>
               </div>
             </motion.div>
